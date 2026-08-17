@@ -27,7 +27,7 @@ class CodeAgent:
                 description="Clarification required before generation.",
                 assumptions=[],
                 passed=False,
-                confidence="high",
+                confidence="low",
                 issues=[result.clarification_needed],
                 retries_taken=0,
                 clarification_needed=result.clarification_needed
