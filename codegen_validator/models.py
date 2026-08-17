@@ -11,8 +11,9 @@ Confidence = Literal["high", "medium", "low"]
 class GenResult:
     code: str
     description: str
+    tests: str = ""  # pytest-style or __main__ demo calls that actually exercise `code`
     assumptions: list[str] = field(default_factory=list)
-    clarification_needed: str | None = None  # New field
+    clarification_needed: str | None = None
 
 @dataclass(slots=True)
 class CheckResult:
@@ -31,7 +32,8 @@ class AgentResult:
     confidence: Confidence
     issues: list[str]
     retries_taken: int
-    clarification_needed: str | None = None  
+    tests: str = ""
+    clarification_needed: str | None = None
 
 
 
@@ -47,4 +49,3 @@ class AgentResponse(BaseModel):
     confidence: Confidence
     issues: list[str]
     retries_taken: int
-
