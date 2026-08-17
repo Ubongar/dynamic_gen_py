@@ -1,13 +1,19 @@
+# pyright: reportMissingImports=false
 import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-import groq  # Import the base groq module to catch its errors
-from groq import Groq
+import groq  # type: ignore[import-not-found]  # Import the base groq module to catch its errors
+from groq import Groq  # type: ignore[import-not-found]
 from pydantic import BaseModel, ValidationError
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential 
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from .models import Confidence, GenResult
 

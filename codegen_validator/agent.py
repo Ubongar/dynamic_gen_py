@@ -33,11 +33,11 @@ class CodeAgent:
                 clarification_needed=result.clarification_needed
             )
         retries_taken = 0
-        retries_taken = 0
-        last_issues: list[str] = []
+        last_issues = []
         last_confidence = "low"
 
         for attempt in range(self._max_retries):
+            # 1. Static Syntax Check
             static = self._validator.static_check(result.code)
             if not static.passed:
                 last_issues = static.issues
@@ -48,6 +48,18 @@ class CodeAgent:
                 result = self._generator.repair(query, result.code, [static.error or "Syntax validation failed."])
                 continue
 
+            # 2. Execution Check (The Sandbox)
+            execution = self._validator.execution_check(result.code)
+            if not execution.passed:
+                last_issues = execution.issues
+                last_confidence = execution.confidence
+                if attempt == self._max_retries - 1:
+                    break
+                retries_taken += 1
+                result = self._generator.repair(query, result.code, execution.issues)
+                continue
+
+            # 3. Logic Check
             logic = self._validator.logic_check(result.code, result.description, query)
             last_issues = logic.issues
             last_confidence = logic.confidence

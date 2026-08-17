@@ -56,9 +56,16 @@ def main() -> int:
     print(result.code)
     print()
     print(f"Description: {result.description}")
-    print(f"Assumptions: {json.dumps(result.assumptions)}")
+    
+    # This prints out the defaults/assumptions the AI made because the prompt was vague
+    if result.assumptions:
+        print("💡 Notice: The prompt was broad, so the following default assumptions were made:")
+        for assumption in result.assumptions:
+            print(f"  - {assumption}")
+        print("  (If you want to change these, specify the exact parameters in your prompt!)")
+
     print(
-        f"PASS/FAIL: {'PASS' if result.passed else 'FAIL'} | "
+        f"\nPASS/FAIL: {'PASS' if result.passed else 'FAIL'} | "
         f"confidence={result.confidence} | retries_taken={result.retries_taken}"
     )
     
