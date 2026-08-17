@@ -1,13 +1,13 @@
-from __future__ import annotations
-
 import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+import groq  # Import the base groq module to catch its errors
 from groq import Groq
 from pydantic import BaseModel, ValidationError
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential 
 
 from .models import Confidence, GenResult
 
@@ -23,6 +23,7 @@ class _GenResultSchema(BaseModel):
     code: str
     description: str
     assumptions: list[str]
+    clarification_needed: str | None = None # Allow the LLM to return null or a string
 
 
 class _LogicResultSchema(BaseModel):
@@ -42,7 +43,20 @@ class LLMClient:
     def __init__(self, api_key: str, model: str = "llama-3.1-70b-versatile") -> None:
         self._client = Groq(api_key=api_key)
         self._model = model
-
+        
+    @staticmethod
+    def _parse_gen_result(payload: dict[str, Any]) -> GenResult:
+        try:
+            parsed = _GenResultSchema.model_validate(payload)
+        except ValidationError as exc:
+            raise LLMClientError(f"Invalid generator schema: {exc}") from exc
+        return GenResult(
+            code=parsed.code,
+            description=parsed.description,
+            assumptions=parsed.assumptions,
+            clarification_needed=parsed.clarification_needed, # Pass it through
+        )
+        
     def generate_code(self, query: str, system_prompt: str) -> GenResult:
         payload = self._chat_json(system_prompt=system_prompt, user_prompt=query)
         return self._parse_gen_result(payload)
@@ -50,8 +64,14 @@ class LLMClient:
     def repair_code(self, prompt: str) -> GenResult:
         payload = self._chat_json(
             system_prompt=(
-                "You are a precise Python code generator and repair assistant. "
-                "Return strict JSON matching: {code, description, assumptions}."
+                "You are an elite Python code repair assistant. The previous generated code failed static validation or logic checks. "
+                "CRITICAL CONSTRAINTS:\n"
+                "1. Fix the reported validator issues directly without stripping out existing functionality or comments.\n"
+                "2. Maintain strict syntax safety by using raw strings (r\"...\") for any docstrings, regex, and math.\n"
+                "3. Ensure the repaired code retains type hints and graceful try/except error handling.\n"
+                "4. Return ONLY strict JSON matching: {\"code\": \"string\", \"description\": \"string\", "
+                "\"assumptions\": [\"string\"], \"clarification_needed\": \"string or null\"}. "
+                "Ensure 'assumptions' is a JSON array. DO NOT include markdown code block wrappers."
             ),
             user_prompt=prompt,
         )
@@ -76,6 +96,15 @@ class LLMClient:
             confidence=parsed.confidence,
         )
 
+    @retry(
+        # Only retry on actual Groq API issues (rate limits, timeouts, 500 errors)
+        retry=retry_if_exception_type((groq.APIError, groq.APIConnectionError, groq.RateLimitError, groq.InternalServerError)),
+        # Wait 1s, then 2s, then 4s, etc., up to 10 seconds between retries
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        # Give up after 4 total attempts
+        stop=stop_after_attempt(4),
+        reraise=True
+    )
     def _chat_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         self._log_stage("llm_call_start")
         response = self._client.chat.completions.create(
@@ -98,18 +127,6 @@ class LLMClient:
         if not isinstance(parsed, dict):
             raise LLMClientError("LLM JSON response was not an object.")
         return parsed
-
-    @staticmethod
-    def _parse_gen_result(payload: dict[str, Any]) -> GenResult:
-        try:
-            parsed = _GenResultSchema.model_validate(payload)
-        except ValidationError as exc:
-            raise LLMClientError(f"Invalid generator schema: {exc}") from exc
-        return GenResult(
-            code=parsed.code,
-            description=parsed.description,
-            assumptions=parsed.assumptions,
-        )
 
     @staticmethod
     def _log_stage(stage: str) -> None:

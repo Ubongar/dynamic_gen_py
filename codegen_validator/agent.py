@@ -20,6 +20,19 @@ class CodeAgent:
     def run(self, query: str) -> AgentResult:
         self._log_stage("agent_run_start")
         result = self._generator.generate(query)
+        if result.clarification_needed:
+            self._log_stage("agent_run_clarification_needed")
+            return AgentResult(
+                code="",
+                description="Clarification required before generation.",
+                assumptions=[],
+                passed=False,
+                confidence="high",
+                issues=[result.clarification_needed],
+                retries_taken=0,
+                clarification_needed=result.clarification_needed
+            )
+        retries_taken = 0
         retries_taken = 0
         last_issues: list[str] = []
         last_confidence = "low"
@@ -48,6 +61,7 @@ class CodeAgent:
                     confidence=logic.confidence,
                     issues=logic.issues,
                     retries_taken=retries_taken,
+                    clarification_needed=None,
                 )
 
             if attempt == self._max_retries - 1:
@@ -64,6 +78,7 @@ class CodeAgent:
             confidence=last_confidence,
             issues=last_issues,
             retries_taken=retries_taken,
+            clarification_needed=None,
         )
 
     @staticmethod

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-import argparse
+import os
 import time
 from dataclasses import dataclass
 from statistics import mean
 
-import httpx
+from codegen_validator.agent import CodeAgent
+from codegen_validator.generator import Generator
+from codegen_validator.llm_client import LLMClient
+from codegen_validator.validator import Validator
 
 
 @dataclass(slots=True)
@@ -27,6 +30,19 @@ class QueryOutcome:
     latency_ms: float
     confidence: str
     manual_review: str
+
+
+def create_agent() -> CodeAgent:
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is required.")
+        
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    llm_client = LLMClient(api_key=api_key, model=model)
+    generator = Generator(llm_client=llm_client)
+    validator = Validator(llm_client=llm_client)
+    
+    return CodeAgent(generator=generator, validator=validator, max_retries=3)
 
 
 def default_query_set() -> list[QueryCase]:
@@ -52,31 +68,33 @@ def default_query_set() -> list[QueryCase]:
     ]
 
 
-def run_harness(base_url: str, cases: list[QueryCase]) -> list[QueryOutcome]:
+def run_harness(cases: list[QueryCase]) -> list[QueryOutcome]:
     outcomes: list[QueryOutcome] = []
-    with httpx.Client(timeout=180.0) as client:
-        for case in cases:
-            start = time.perf_counter()
-            response = client.post(f"{base_url.rstrip('/')}/generate", json={"query": case.query})
-            response.raise_for_status()
-            latency_ms = (time.perf_counter() - start) * 1000.0
-            payload = response.json()
+    agent = create_agent()
+    
+    for case in cases:
+        start = time.perf_counter()
+        
+        # Run the agent directly instead of using httpx.post
+        result = agent.run(case.query)
+        
+        latency_ms = (time.perf_counter() - start) * 1000.0
 
-            passed = bool(payload["passed"])
-            retries_taken = int(payload["retries_taken"])
-            outcomes.append(
-                QueryOutcome(
-                    category=case.category,
-                    name=case.name,
-                    passed=passed,
-                    pass_at_1=passed and retries_taken == 0,
-                    pass_at_3=passed and retries_taken <= 3,
-                    retries_taken=retries_taken,
-                    latency_ms=latency_ms,
-                    confidence=str(payload["confidence"]),
-                    manual_review=case.manual_review,
-                )
+        passed = bool(result.passed)
+        retries_taken = int(result.retries_taken)
+        outcomes.append(
+            QueryOutcome(
+                category=case.category,
+                name=case.name,
+                passed=passed,
+                pass_at_1=passed and retries_taken == 0,
+                pass_at_3=passed and retries_taken <= 3,
+                retries_taken=retries_taken,
+                latency_ms=latency_ms,
+                confidence=str(result.confidence),
+                manual_review=case.manual_review,
             )
+        )
     return outcomes
 
 
@@ -97,19 +115,15 @@ def print_report(outcomes: list[QueryOutcome]) -> None:
     print(f"Summary: pass@1={pass_at_1:.3f} pass@3={pass_at_3:.3f} avg_retries={avg_retries:.2f} avg_latency_ms={avg_latency:.2f}")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run query harness against codegen_validator API")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="Base URL for API server")
-    return parser.parse_args()
-
-
 def main() -> int:
-    args = parse_args()
-    outcomes = run_harness(base_url=args.base_url, cases=default_query_set())
-    print_report(outcomes)
-    return 0
+    try:
+        outcomes = run_harness(cases=default_query_set())
+        print_report(outcomes)
+        return 0
+    except Exception as exc:
+        print(f"Harness failed: {exc}")
+        return 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

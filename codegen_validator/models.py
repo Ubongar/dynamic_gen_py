@@ -5,16 +5,14 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-
 Confidence = Literal["high", "medium", "low"]
-
 
 @dataclass(slots=True)
 class GenResult:
     code: str
     description: str
     assumptions: list[str] = field(default_factory=list)
-
+    clarification_needed: str | None = None  # New field
 
 @dataclass(slots=True)
 class CheckResult:
@@ -23,7 +21,6 @@ class CheckResult:
     confidence: Confidence = "low"
     error: str | None = None
     notes: list[str] = field(default_factory=list)
-
 
 @dataclass(slots=True)
 class AgentResult:
@@ -34,6 +31,8 @@ class AgentResult:
     confidence: Confidence
     issues: list[str]
     retries_taken: int
+    clarification_needed: str | None = None  
+
 
 
 class GenerateRequest(BaseModel):

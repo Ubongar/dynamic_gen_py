@@ -2,46 +2,70 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
-import httpx
+from .agent import CodeAgent
+from .generator import Generator
+from .llm_client import LLMClient
+from .validator import Validator
+
+
+def create_agent() -> CodeAgent:
+    # Use environment variable or default to the provided key
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is required.")
+        
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    llm_client = LLMClient(api_key=api_key, model=model)
+    generator = Generator(llm_client=llm_client)
+    validator = Validator(llm_client=llm_client)
+    
+    return CodeAgent(generator=generator, validator=validator, max_retries=3)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="CLI for codegen_validator API")
+    parser = argparse.ArgumentParser(description="Direct CLI for codegen_validator")
     parser.add_argument("query", help="Natural language query to generate code for")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="Base URL for API server")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    endpoint = f"{args.base_url.rstrip('/')}/generate"
-    payload = {"query": args.query}
-    response = httpx.post(endpoint, json=payload, timeout=120.0)
-    response.raise_for_status()
-    data = response.json()
+    
+    try:
+        agent = create_agent()
+    except RuntimeError as exc:
+        print(f"Initialization Error: {exc}", file=sys.stderr)
+        return 2
+
+    # Run the agent directly with the provided query
+    result = agent.run(args.query)
+    
+    if result.clarification_needed:
+        print("\n🛑 Missing Information Detected:")
+        print(f"The AI needs clarification: {result.clarification_needed}")
+        print("Please run the CLI again with a more specific prompt.\n")
+        return 1
 
     print("Generated Code:")
-    print(data["code"])
+    print(result.code)
     print()
-    print(f"Description: {data['description']}")
-    print(f"Assumptions: {json.dumps(data['assumptions'])}")
+    print(f"Description: {result.description}")
+    print(f"Assumptions: {json.dumps(result.assumptions)}")
     print(
-        f"PASS/FAIL: {'PASS' if data['passed'] else 'FAIL'} | "
-        f"confidence={data['confidence']} | retries_taken={data['retries_taken']}"
+        f"PASS/FAIL: {'PASS' if result.passed else 'FAIL'} | "
+        f"confidence={result.confidence} | retries_taken={result.retries_taken}"
     )
-    if data["issues"]:
+    
+    if result.issues:
         print("Issues:")
-        for issue in data["issues"]:
+        for issue in result.issues:
             print(f"- {issue}")
-    return 0 if data["passed"] else 1
+            
+    return 0 if result.passed else 1
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except httpx.HTTPError as exc:
-        print(f"Request failed: {exc}", file=sys.stderr)
-        raise SystemExit(2) from exc
-
+    raise SystemExit(main())

@@ -5,17 +5,18 @@ description = "Code generation and static correctness validation pipeline"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi>=0.116.0",
     "groq>=0.31.0",
-    "httpx>=0.28.0",
     "pyflakes>=3.3.0",
     "pydantic>=2.11.0",
-    "uvicorn>=0.35.0",
+    "python-dotenv>=1.2.3",
+    "tenacity>=8.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.4.0",
+    "ruff>=0.3.0",
+    "mypy>=1.9.0",
 ]
 
 [build-system]
