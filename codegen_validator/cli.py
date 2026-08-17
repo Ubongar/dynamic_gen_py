@@ -9,7 +9,10 @@ from .agent import CodeAgent
 from .generator import Generator
 from .llm_client import LLMClient
 from .validator import Validator
+from dotenv import load_dotenv
 
+# Load the environment variables from your .env file
+load_dotenv()
 
 def create_agent() -> CodeAgent:
     # Use environment variable or default to the provided key

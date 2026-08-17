@@ -1,1 +1,36 @@
-*.env
+# Environments and Secrets (CRITICAL)
+.env
+.env.*
+.venv/
+venv/
+env/
+
+# Python Byte-compiled / Optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing and Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Linting and Type Checking caches
+.ruff_cache/
+.mypy_cache/
+
+# Build and Distribution artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# OS generated files
+.DS_Store
+Thumbs.db

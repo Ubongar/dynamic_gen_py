@@ -40,7 +40,7 @@ class LogicReviewResult:
 
 
 class LLMClient:
-    def __init__(self, api_key: str, model: str = "llama-3.1-70b-versatile") -> None:
+    def __init__(self, api_key: str, model: str = "openai/gpt-oss-120b") -> None:
         self._client = Groq(api_key=api_key)
         self._model = model
         
@@ -115,6 +115,7 @@ class LLMClient:
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
+            max_tokens=4096
         )
         self._log_stage("llm_call_end")
         content = response.choices[0].message.content
@@ -122,10 +123,22 @@ class LLMClient:
             raise LLMClientError("LLM returned empty content.")
         try:
             parsed = json.loads(content)
+            
+            # Defensive Check 1: If the LLM double-encoded the JSON into a string, parse it again
+            if isinstance(parsed, str):
+                parsed = json.loads(parsed)
+                
+            # Defensive Check 2: If the LLM wrapped the object in a list, extract the first item
+            if isinstance(parsed, list) and len(parsed) > 0:
+                parsed = parsed[0]
+                
         except json.JSONDecodeError as exc:
-            raise LLMClientError(f"LLM did not return valid JSON: {exc}") from exc
+            raise LLMClientError(f"LLM did not return valid JSON. \nRaw Output: {content}\nError: {exc}") from exc
+            
+        # Final strict validation with raw output debugging
         if not isinstance(parsed, dict):
-            raise LLMClientError("LLM JSON response was not an object.")
+            raise LLMClientError(f"LLM JSON response was not an object. Type received: {type(parsed)}\nRaw Output: {content}")
+            
         return parsed
 
     @staticmethod

@@ -9,6 +9,10 @@ from codegen_validator.agent import CodeAgent
 from codegen_validator.generator import Generator
 from codegen_validator.llm_client import LLMClient
 from codegen_validator.validator import Validator
+from dotenv import load_dotenv
+
+# Load the environment variables from your .env file
+load_dotenv()
 
 
 @dataclass(slots=True)
