@@ -155,7 +155,8 @@ class Validator:
             )
 
         try:
-            result = subprocess.run(  # fixed argv, no shell — see docstring above
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            result = subprocess.run(
                 [sys.executable, temp_path],
                 capture_output=True,
                 text=True,
