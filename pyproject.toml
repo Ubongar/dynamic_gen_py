@@ -1,0 +1,27 @@
+[project]
+name = "codegen-validator"
+version = "0.1.0"
+description = "Code generation and static correctness validation pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "groq>=0.31.0",
+    "pyflakes>=3.3.0",
+    "pydantic>=2.11.0",
+    "python-dotenv>=1.2.3",
+    "tenacity>=8.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.0",
+    "ruff>=0.3.0",
+    "mypy>=1.9.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
