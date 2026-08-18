@@ -116,8 +116,8 @@ class LLMClient:
         )
 
     @retry(
-        # Fix: Use openai exceptions since we are using the OpenAI client, and add LLMClientError
-        retry=retry_if_exception_type((APIStatusError, APIConnectionError, RateLimitError, InternalServerError, LLMClientError)),
+        # Removed LLMClientError so fatal errors (like 400 Bad Request) fail fast
+        retry=retry_if_exception_type((APIConnectionError, RateLimitError, InternalServerError)),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         stop=stop_after_attempt(4),
         reraise=True
@@ -132,10 +132,31 @@ class LLMClient:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                # Increased to 8192 to give reasoning models enough room to "think"
                 max_tokens=8192
             )
+        except APIStatusError as exc:
+            # Let tenacity automatically retry rate limits and internal server errors
+            if isinstance(exc, (RateLimitError, InternalServerError)):
+                raise
+            
+            # For all other API errors (e.g., 400, 401, 404), format a detailed message and fail immediately
+            self._log_stage("llm_call_api_status_error")
+            status = getattr(exc, "status_code", None)
+            response_data = getattr(exc, "response", None)
+            
+            details = []
+            if status is not None:
+                details.append(f"status {status}")
+            if response_data is not None:
+                details.append(f"response: {response_data}")
+            details_str = f" ({', '.join(details)})" if details else ""
+            
+            raise LLMClientError(
+                f"The LLM provider rejected the request{details_str}: {exc}"
+            ) from exc
+            
         except Exception as exc:
+            # Fallback for completely unexpected network or system errors
             self._log_stage("llm_call_api_status_error")
             raise LLMClientError(f"LLM request failed: {exc}") from exc
 
@@ -148,7 +169,6 @@ class LLMClient:
         content = message.content
 
         if not content:
-            # Cleanly handle the reasoning model timeout without printing a wall of text
             reasoning = getattr(message, 'reasoning', None)
             if reasoning:
                 raise LLMClientError(
@@ -174,7 +194,6 @@ class LLMClient:
             if isinstance(parsed, list) and len(parsed) > 0:
                 parsed = parsed[0]
         except json.JSONDecodeError as exc:
-            # Truncate the raw output so it doesn't flood the terminal
             truncated_output = content[:500] + "\n...[truncated]" if len(content) > 500 else content
             raise LLMClientError(f"LLM did not return valid JSON.\nError: {exc}\nRaw Output:\n{truncated_output}") from exc
 
