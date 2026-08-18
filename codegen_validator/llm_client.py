@@ -157,8 +157,10 @@ class LLMClient:
             
         except Exception as exc:
             # Fallback for completely unexpected network or system errors
-            self._log_stage("llm_call_api_status_error")
-            raise LLMClientError(f"LLM request failed: {exc}") from exc
+            self._log_stage("llm_call_unexpected_error")
+            raise LLMClientError(
+                f"LLM request failed ({type(exc).__name__}): {exc!r}"
+            ) from exc
 
         self._log_stage("llm_call_end")
         
