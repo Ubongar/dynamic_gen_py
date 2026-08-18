@@ -1,12 +1,11 @@
-# pyright: reportMissingImports=false
 import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-import groq  # type: ignore[import-not-found]  # Import the base groq module to catch its errors
-from groq import Groq  # type: ignore[import-not-found]
+from openai import OpenAI, APIStatusError, APIConnectionError, RateLimitError, InternalServerError
 from pydantic import BaseModel, ValidationError
 from tenacity import (
     retry,
@@ -47,9 +46,12 @@ class LogicReviewResult:
 
 
 class LLMClient:
-    def __init__(self, api_key: str, model: str = "openai/gpt-oss-120b") -> None:
-        self._client = Groq(api_key=api_key)
-        self._model = model
+    def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
+        self._client = OpenAI(
+            api_key=api_key or os.getenv("OPENAI_API_KEY"),
+            base_url=os.getenv("OPENAI_BASE_URL"),
+        )
+        self._model = model or os.getenv("OPENAI_MODEL", "olori-image")
 
     @staticmethod
     def _parse_gen_result(payload: dict[str, Any]) -> GenResult:
@@ -82,7 +84,8 @@ class LLMClient:
                 "conn.close() in a finally block (or via contextlib.closing). `with connection:` only handles the "
                 "transaction, it does not close the connection, leaving it open causes file-lock errors.\n"
                 "4. The 'tests' field must call every function in 'code' with real inputs and assert on results, it "
-                "must not be left empty.\n"
+                "must not be left empty. DO NOT import the generated classes/functions in the tests field; the test code "
+                "is appended directly to the main code during validation and they are already in scope.\n "
                 "5. Return ONLY strict JSON matching: {\"code\": \"string\", \"tests\": \"string\", "
                 "\"description\": \"string\", \"assumptions\": [\"string\"], \"clarification_needed\": \"string or null\"}. "
                 "Ensure 'assumptions' is a JSON array. DO NOT include markdown code block wrappers. "
@@ -113,11 +116,9 @@ class LLMClient:
         )
 
     @retry(
-        # Only retry on actual Groq API issues (rate limits, timeouts, 500 errors)
-        retry=retry_if_exception_type((groq.APIError, groq.APIConnectionError, groq.RateLimitError, groq.InternalServerError)),
-        # Wait 1s, then 2s, then 4s, etc., up to 10 seconds between retries
+        # Fix: Use openai exceptions since we are using the OpenAI client, and add LLMClientError
+        retry=retry_if_exception_type((APIStatusError, APIConnectionError, RateLimitError, InternalServerError, LLMClientError)),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        # Give up after 4 total attempts
         stop=stop_after_attempt(4),
         reraise=True
     )
@@ -131,54 +132,57 @@ class LLMClient:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                response_format={"type": "json_object"},
-                # NOTE: max_tokens is RESERVED budget, not just actual usage, Groq's
-                # tokens-per-minute limit is checked against (prompt_tokens + max_tokens),
-                # not what's actually generated. Keep this comfortably under your account's
-                # TPM cap minus a typical prompt size, raise it only alongside checking your
-                # actual TPM limit (see Groq console > Settings > Billing).
-                max_tokens=4096
+                # Increased to 8192 to give reasoning models enough room to "think"
+                max_tokens=8192
             )
-        except groq.APIStatusError as exc:
-            if isinstance(exc, (groq.RateLimitError, groq.InternalServerError)):
-                # These ARE meant to be retried by the @retry decorator wrapping this
-                # method (see retry_if_exception_type above), re-raise unchanged so
-                # tenacity still sees the original type and retries as configured.
-                raise
-            # Everything else here (BadRequestError from malformed model JSON, the
-            # 413 tokens-per-minute case, etc.) is not fixed by retrying an identical
-            # request, so convert it to a clean, catchable error instead of letting
-            # the raw API exception propagate all the way up and crash the CLI.
+        except Exception as exc:
             self._log_stage("llm_call_api_status_error")
-            raise LLMClientError(
-                f"The LLM provider rejected the request (status {exc.status_code}). "
-                f"Common causes: malformed JSON from the model, or the request exceeding "
-                f"your account's tokens-per-minute limit. Raw provider error: {exc!s}"
-            ) from exc
-        self._log_stage("llm_call_end")
-        content = response.choices[0].message.content
-        if content is None:
-            raise LLMClientError("LLM returned empty content.")
-        try:
-            parsed = json.loads(content)
+            raise LLMClientError(f"LLM request failed: {exc}") from exc
 
-            # Defensive Check 1: If the LLM double-encoded the JSON into a string, parse it again
+        self._log_stage("llm_call_end")
+        
+        if not response.choices or not response.choices[0].message:
+            raise LLMClientError("Server returned an empty or malformed payload.")
+
+        message = response.choices[0].message
+        content = message.content
+
+        if not content:
+            # Cleanly handle the reasoning model timeout without printing a wall of text
+            reasoning = getattr(message, 'reasoning', None)
+            if reasoning:
+                raise LLMClientError(
+                    "The model ran out of tokens while 'thinking' and did not output the final code. "
+                    "Try increasing max_tokens further."
+                )
+            raise LLMClientError("LLM returned empty content. No code was generated.")
+
+        # Strip possible markdown code fences if the model adds ```json wrappers
+        clean_content = content.strip()
+        if clean_content.startswith("```"):
+            lines = clean_content.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            clean_content = "\n".join(lines).strip()
+
+        try:
+            parsed = json.loads(clean_content)
             if isinstance(parsed, str):
                 parsed = json.loads(parsed)
-
-            # Defensive Check 2: If the LLM wrapped the object in a list, extract the first item
             if isinstance(parsed, list) and len(parsed) > 0:
                 parsed = parsed[0]
-
         except json.JSONDecodeError as exc:
-            raise LLMClientError(f"LLM did not return valid JSON. \nRaw Output: {content}\nError: {exc}") from exc
+            # Truncate the raw output so it doesn't flood the terminal
+            truncated_output = content[:500] + "\n...[truncated]" if len(content) > 500 else content
+            raise LLMClientError(f"LLM did not return valid JSON.\nError: {exc}\nRaw Output:\n{truncated_output}") from exc
 
-        # Final strict validation with raw output debugging
         if not isinstance(parsed, dict):
-            raise LLMClientError(f"LLM JSON response was not an object. Type received: {type(parsed)}\nRaw Output: {content}")
+            raise LLMClientError(f"LLM JSON response was not an object. Type received: {type(parsed)}")
 
         return parsed
-
+    
     @staticmethod
     def _log_stage(stage: str) -> None:
         LOGGER.info("%s %s", stage, datetime.now(timezone.utc).isoformat())

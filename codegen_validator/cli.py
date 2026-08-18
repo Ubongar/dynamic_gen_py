@@ -14,11 +14,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def create_agent() -> CodeAgent:
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("GROQ_API_KEY is required.")
+        raise RuntimeError("OPENAI_API_KEY is required.")
 
-    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    model = os.getenv("OPENAI_MODEL", "olori-image")
     llm_client = LLMClient(api_key=api_key, model=model)
     generator = Generator(llm_client=llm_client)
     validator = Validator(llm_client=llm_client)
