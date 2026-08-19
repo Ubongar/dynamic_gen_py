@@ -156,9 +156,9 @@ def _serialize_agent_result(result: Any, max_str_len: int = 4000) -> dict[str, A
     """
     Turns whatever agent.run() returned into a plain JSON-safe dict.
     String values and repr-based fallbacks are truncated via `_truncate_str` to
-    keep the serialized representation within `max_str_len` characters,
-    including the truncation suffix, to prevent the output JSON from
-    ballooning in size.
+    keep individual string fields within `max_str_len` characters,
+    including the truncation suffix. This prevents unexpectedly massive
+    strings (like giant stack traces) from bloating the output JSON.
     """
     if is_dataclass(result) and not isinstance(result, type):
         raw = asdict(result)
