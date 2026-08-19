@@ -23,6 +23,8 @@ _DEFAULT_TIMEOUT_SEC = 10
 _DEFAULT_MEMORY_LIMIT_MB = 256
 _MAX_OUTPUT_CHARS = 4000
 
+_ENVIRONMENT_ISSUE_PREFIX = "ENVIRONMENT ISSUE (not a code bug): "
+
 
 def _truncate(text: str, limit: int = _MAX_OUTPUT_CHARS) -> str:
     """Cap captured stdout/stderr so a pathological program can't balloon the result."""
@@ -44,6 +46,27 @@ def _apply_resource_limits(memory_limit_mb: int, cpu_limit_sec: int) -> None:
     memory_bytes = memory_limit_mb * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))  # type: ignore[attr-defined]
     resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit_sec, cpu_limit_sec))  # type: ignore[attr-defined]
+
+
+def _is_missing_dependency_failure(stderr: str) -> bool:
+    """
+    Detects the specific pattern where generated code correctly tries an
+    import, falls back to auto-installing the package on ImportError, and
+    that install fails because the execution sandbox itself has no working
+    pip (a broken/minimal venv), not because the generated code is wrong.
+    This is intentionally narrow: it only matches when both a missing
+    module AND a failed pip invocation show up together, so a genuine
+    "forgot to import X" bug in the generated code (which raises
+    ModuleNotFoundError alone, with no pip attempt) is still reported as a
+    normal failure.
+    """
+    has_missing_module = "ModuleNotFoundError" in stderr or "No module named" in stderr
+    pip_attempt_failed = (
+        "No module named pip" in stderr
+        or "CalledProcessError" in stderr
+        or "pip install" in stderr
+    )
+    return has_missing_module and pip_attempt_failed
 
 
 class Validator:
@@ -186,6 +209,31 @@ class Validator:
                 )
 
             self._log_stage("execution_check_fail")
+
+            if _is_missing_dependency_failure(stderr):
+                # The generated code's own logic never got to run, it failed
+                # while trying to auto-install a missing package because this
+                # sandbox's venv has no working pip. Surface this distinctly
+                # so it isn't mistaken for a real logic bug in the generated
+                # code, and don't send it into the repair loop as if the code
+                # itself needs changing, low confidence reflects that we did
+                # not actually verify the code's behavior.
+                self._log_stage("execution_check_environment_issue")
+                issue = (
+                    f"{_ENVIRONMENT_ISSUE_PREFIX}the generated code's dependency "
+                    f"auto-install fallback failed because this execution sandbox "
+                    f"has no working pip. This does not indicate a problem with the "
+                    f"generated code's logic. Fix by running 'python -m ensurepip "
+                    f"--upgrade' in the sandbox venv, or pre-installing the needed "
+                    f"packages there.\nOriginal error:\n{stderr}"
+                )
+                return CheckResult(
+                    passed=False,
+                    issues=[issue],
+                    confidence="low",
+                    error="Environment Error (missing pip in sandbox).",
+                )
+
             issue = f"Runtime Error (Exit Code {result.returncode}):\n{stderr}"
             return CheckResult(
                 passed=False,
