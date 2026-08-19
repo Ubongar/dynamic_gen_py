@@ -9,7 +9,7 @@ crash or exception on any single query is caught and recorded as a FAIL row,
 it never stops the harness from running the rest of the list, that isolation
 is the whole point of this file.
 
-Results are written to result.json by default (change with --output). The
+Results are appended to result.json by default (change with --output). The
 CLI still prints a summary table as it runs, but result.json is now the
 source of truth, since it also holds the full generated code per query,
 which the terminal table does not show.
@@ -93,10 +93,20 @@ QUERIES: list[TestQuery] = [
 ]
 
 
-# Candidate attribute names for "the actual code/answer" on whatever object# agent.run() returns. Different versions of AgentResult in this project
+# Candidate attribute names for "the actual code/answer" on whatever object
+# agent.run() returns. Different versions of AgentResult in this project
 # have used different names for this field, so we try them in order rather
 # than hardcoding one and silently getting None back if it changes again.
-
+CODE_FIELD_CANDIDATES: tuple[str, ...] = (
+    "code",
+    "generated_code",
+    "final_code",
+    "output_code",
+    "snippet",
+    "solution",
+    "answer",
+    "response",
+)
 
 
 @dataclass(slots=True)
@@ -126,11 +136,10 @@ def create_agent(max_retries: int) -> CodeAgent:
     return CodeAgent(generator=generator, validator=validator, max_retries=max_retries)
 
 
-def _serialize_agent_result(result: Any) -> dict[str, Any]:
+def _serialize_agent_result(result: Any, max_str_len: int = 4000) -> dict[str, Any]:
     """
-    Turns whatever agent.run() returned into a plain JSON-safe dict, so the
-    full result always lands in result.json even if the field holding the
-    actual generated code is named something this file does not know about.
+    Turns whatever agent.run() returned into a plain JSON-safe dict, truncating 
+    excessively long strings to prevent the output JSON from ballooning in size.
     """
     if is_dataclass(result) and not isinstance(result, type):
         raw = asdict(result)
@@ -140,21 +149,26 @@ def _serialize_agent_result(result: Any) -> dict[str, Any]:
         raw = {"repr": repr(result)}
 
     def _make_safe(value: Any) -> Any:
-        if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, str):
+            return value if len(value) <= max_str_len else value[:max_str_len] + "... [truncated]"
+        if isinstance(value, (int, float, bool)) or value is None:
             return value
         if isinstance(value, (list, tuple)):
             return [_make_safe(v) for v in value]
         if isinstance(value, dict):
             return {str(k): _make_safe(v) for k, v in value.items()}
-        return repr(value)
+        
+        rep = repr(value)
+        return rep if len(rep) <= max_str_len else rep[:max_str_len] + "... [truncated]"
 
     return {k: _make_safe(v) for k, v in raw.items()}
 
 
 def _extract_code(raw: dict[str, Any]) -> str | None:
-    value = raw.get("code")
-    if isinstance(value, str) and value.strip():
-        return value
+    for field_name in CODE_FIELD_CANDIDATES:
+        value = raw.get(field_name)
+        if isinstance(value, str) and value.strip():
+            return value
     return None
 
 
@@ -277,15 +291,34 @@ def main() -> int:
 
     print_summary(results)
 
-    if not args.no_json_file:
+    if args.no_json_file:
+        if args.output != "result.json":
+            print(f"Notice: --no-json-file was specified; ignoring custom output path '{args.output}'.")
+    else:
         payload = {
             "run_at": datetime.now(timezone.utc).isoformat(),
             "max_retries": args.max_retries,
             "results": [asdict(r) for r in results],
         }
+        
+        # Read existing history if the file exists
+        historical_data = []
+        if os.path.exists(args.output):
+            try:
+                with open(args.output, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    historical_data = data if isinstance(data, list) else [data]
+            except json.JSONDecodeError:
+                pass # Start fresh if file is empty or corrupted
+
+        # Append the new run
+        historical_data.append(payload)
+
+        # Write the updated history back
         with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        print(f"Full results (including generated code per query) written to {args.output}")
+            json.dump(historical_data, f, indent=2)
+            
+        print(f"Full results (including generated code per query) appended to {args.output}")
 
     any_crashed = any(r.crashed for r in results)
     return 1 if any_crashed else 0
