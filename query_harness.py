@@ -93,10 +93,22 @@ QUERIES: list[TestQuery] = [
 ]
 
 
-# Candidate attribute names for "the actual code/answer" on whatever object# agent.run() returns. Different versions of AgentResult in this project
+# Candidate attribute names for "the actual code/answer" on whatever object
+# agent.run() returns. Different versions of AgentResult in this project
 # have used different names for this field, so we try them in order rather
 # than hardcoding one and silently getting None back if it changes again.
+CODE_FIELD_CANDIDATES: tuple[str, ...] = (
+    "code",
+    "generated_code",
+    "final_code",
+    "output_code",
+    "snippet",
+    "solution",
+    "answer",
+    "response",
+)
 
+TRUNCATION_SUFFIX = "... [truncated]"
 
 
 @dataclass(slots=True)
@@ -126,11 +138,27 @@ def create_agent(max_retries: int) -> CodeAgent:
     return CodeAgent(generator=generator, validator=validator, max_retries=max_retries)
 
 
-def _serialize_agent_result(result: Any) -> dict[str, Any]:
+def _truncate_str(value: str, max_len: int, suffix: str = TRUNCATION_SUFFIX) -> str:
     """
-    Turns whatever agent.run() returned into a plain JSON-safe dict, so the
-    full result always lands in result.json even if the field holding the
-    actual generated code is named something this file does not know about.
+    Truncate a string to ensure the returned value is <= max_len characters,
+    including any truncation suffix.
+    """
+    if len(value) <= max_len:
+        return value
+    if len(suffix) >= max_len:
+        # In pathological cases where the suffix itself is longer than max_len,
+        # return a truncated suffix to respect the limit.
+        return suffix[:max_len]
+    return value[: max_len - len(suffix)] + suffix
+
+
+def _serialize_agent_result(result: Any, max_str_len: int = 4000) -> dict[str, Any]:
+    """
+    Turns whatever agent.run() returned into a plain JSON-safe dict.
+    String values and repr-based fallbacks are truncated via `_truncate_str` to
+    keep the serialized representation within `max_str_len` characters,
+    including the truncation suffix, to prevent the output JSON from
+    ballooning in size.
     """
     if is_dataclass(result) and not isinstance(result, type):
         raw = asdict(result)
@@ -139,22 +167,29 @@ def _serialize_agent_result(result: Any) -> dict[str, Any]:
     else:
         raw = {"repr": repr(result)}
 
+    def _truncate(value: str) -> str:
+        return _truncate_str(value, max_str_len)
+
     def _make_safe(value: Any) -> Any:
-        if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, str):
+            return _truncate(value)
+        if isinstance(value, (int, float, bool)) or value is None:
             return value
         if isinstance(value, (list, tuple)):
             return [_make_safe(v) for v in value]
         if isinstance(value, dict):
             return {str(k): _make_safe(v) for k, v in value.items()}
-        return repr(value)
+        
+        return _truncate(repr(value))
 
     return {k: _make_safe(v) for k, v in raw.items()}
 
 
 def _extract_code(raw: dict[str, Any]) -> str | None:
-    value = raw.get("code")
-    if isinstance(value, str) and value.strip():
-        return value
+    for field_name in CODE_FIELD_CANDIDATES:
+        value = raw.get(field_name)
+        if isinstance(value, str) and value.strip():
+            return value
     return None
 
 
@@ -277,14 +312,20 @@ def main() -> int:
 
     print_summary(results)
 
-    if not args.no_json_file:
+    if args.no_json_file:
+        if args.output != "result.json":
+            print(f"Notice: --no-json-file was specified; ignoring custom output path '{args.output}'.")
+    else:
         payload = {
             "run_at": datetime.now(timezone.utc).isoformat(),
             "max_retries": args.max_retries,
             "results": [asdict(r) for r in results],
         }
+        
+        # Overwrite the file completely with the new run
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
+            
         print(f"Full results (including generated code per query) written to {args.output}")
 
     any_crashed = any(r.crashed for r in results)
