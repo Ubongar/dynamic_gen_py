@@ -4,14 +4,21 @@ query_harness.py
 Standalone regression/benchmark harness for codegen_validator. Feeds a fixed
 set of natural-language queries through the real CodeAgent pipeline one at a
 time, and reports how each one did: PASS/FAIL, confidence, retries taken,
-latency, and any error. A crash or exception on any single query is caught
-and recorded as a FAIL row, it never stops the harness from running the rest
-of the list, that isolation is the whole point of this file.
+latency, any error, and the actual generated code/answer that came back. A
+crash or exception on any single query is caught and recorded as a FAIL row,
+it never stops the harness from running the rest of the list, that isolation
+is the whole point of this file.
+
+Results are written to result.json by default (change with --output). The
+CLI still prints a summary table as it runs, but result.json is now the
+source of truth, since it also holds the full generated code per query,
+which the terminal table does not show.
 
 Usage:
     python query_harness.py
     python query_harness.py --output results.json
     python query_harness.py --max-retries 2
+    python query_harness.py --no-json-file
 
 Requires OPENAI_API_KEY to be set (same as the CLI). Each query makes real LLM
 calls, so this costs real time and API usage, that's intentional, this is
@@ -27,8 +34,9 @@ import os
 import sys
 import time
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -85,6 +93,12 @@ QUERIES: list[TestQuery] = [
 ]
 
 
+# Candidate attribute names for "the actual code/answer" on whatever object# agent.run() returns. Different versions of AgentResult in this project
+# have used different names for this field, so we try them in order rather
+# than hardcoding one and silently getting None back if it changes again.
+
+
+
 @dataclass(slots=True)
 class QueryResult:
     category: str
@@ -95,8 +109,10 @@ class QueryResult:
     latency_sec: float
     clarification_needed: str | None
     issues: list[str]
+    code: str | None
     crashed: bool
     crash_message: str | None
+    raw_agent_result: dict[str, Any] | None
 
 
 def create_agent(max_retries: int) -> CodeAgent:
@@ -108,6 +124,38 @@ def create_agent(max_retries: int) -> CodeAgent:
     generator = Generator(llm_client=llm_client)
     validator = Validator(llm_client=llm_client)
     return CodeAgent(generator=generator, validator=validator, max_retries=max_retries)
+
+
+def _serialize_agent_result(result: Any) -> dict[str, Any]:
+    """
+    Turns whatever agent.run() returned into a plain JSON-safe dict, so the
+    full result always lands in result.json even if the field holding the
+    actual generated code is named something this file does not know about.
+    """
+    if is_dataclass(result) and not isinstance(result, type):
+        raw = asdict(result)
+    elif hasattr(result, "__dict__"):
+        raw = {k: v for k, v in vars(result).items() if not k.startswith("_")}
+    else:
+        raw = {"repr": repr(result)}
+
+    def _make_safe(value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, (list, tuple)):
+            return [_make_safe(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): _make_safe(v) for k, v in value.items()}
+        return repr(value)
+
+    return {k: _make_safe(v) for k, v in raw.items()}
+
+
+def _extract_code(raw: dict[str, Any]) -> str | None:
+    value = raw.get("code")
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
 
 
 def run_one(agent: CodeAgent, tq: TestQuery) -> QueryResult:
@@ -122,6 +170,7 @@ def run_one(agent: CodeAgent, tq: TestQuery) -> QueryResult:
     try:
         result = agent.run(tq.query)
         latency = time.perf_counter() - start
+        raw = _serialize_agent_result(result)
         return QueryResult(
             category=tq.category,
             query=tq.query,
@@ -131,8 +180,10 @@ def run_one(agent: CodeAgent, tq: TestQuery) -> QueryResult:
             latency_sec=round(latency, 2),
             clarification_needed=result.clarification_needed,
             issues=result.issues,
+            code=_extract_code(raw),
             crashed=False,
             crash_message=None,
+            raw_agent_result=raw,
         )
     except LLMClientError as exc:
         latency = time.perf_counter() - start
@@ -145,8 +196,10 @@ def run_one(agent: CodeAgent, tq: TestQuery) -> QueryResult:
             latency_sec=round(latency, 2),
             clarification_needed=None,
             issues=[],
+            code=None,
             crashed=True,
             crash_message=f"LLMClientError: {exc}",
+            raw_agent_result=None,
         )
     except Exception as exc:  # noqa: BLE001 - intentional: see docstring, isolation is the point
         latency = time.perf_counter() - start
@@ -159,8 +212,10 @@ def run_one(agent: CodeAgent, tq: TestQuery) -> QueryResult:
             latency_sec=round(latency, 2),
             clarification_needed=None,
             issues=[],
+            code=None,
             crashed=True,
             crash_message=f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}",
+            raw_agent_result=None,
         )
 
 
@@ -183,6 +238,8 @@ def print_summary(results: list[QueryResult]) -> None:
             print(f"             -> {crash_head}")
         elif r.clarification_needed:
             print(f"             -> clarification requested: {r.clarification_needed[:80]}")
+        elif r.code is None:
+            print("             -> warning: no code field found on the result, see raw_agent_result in the JSON output")
 
     print("=" * 78)
     print(
@@ -202,7 +259,8 @@ def print_summary(results: list[QueryResult]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the query regression harness against codegen_validator")
-    parser.add_argument("--output", default=None, help="Optional path to write full JSON results")
+    parser.add_argument("--output", default="result.json", help="Path to write full JSON results (default result.json)")
+    parser.add_argument("--no-json-file", action="store_true", help="Skip writing the JSON results file entirely")
     parser.add_argument("--max-retries", type=int, default=3, help="max_retries passed to CodeAgent (default 3)")
     args = parser.parse_args()
 
@@ -219,7 +277,7 @@ def main() -> int:
 
     print_summary(results)
 
-    if args.output:
+    if not args.no_json_file:
         payload = {
             "run_at": datetime.now(timezone.utc).isoformat(),
             "max_retries": args.max_retries,
@@ -227,7 +285,7 @@ def main() -> int:
         }
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
-        print(f"Full results written to {args.output}")
+        print(f"Full results (including generated code per query) written to {args.output}")
 
     any_crashed = any(r.crashed for r in results)
     return 1 if any_crashed else 0
