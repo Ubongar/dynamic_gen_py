@@ -34,5 +34,6 @@ dist/
 # OS generated files
 .DS_Store
 Thumbs.db
-
-results.json
+*.json
+*.csv
+*.db
