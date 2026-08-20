@@ -19,16 +19,15 @@ from .models import Confidence, GenResult
 
 LOGGER = logging.getLogger(__name__)
 
-# Baseline budget for a single request. Kept at the value that's been safe
-# against the provider's reservation-based TPM limit (see _MAX_TOKENS_CEILING).
-_BASE_MAX_TOKENS = 8192
+# Baseline budget for a single request. OpenAI's real rate limits are far
+# higher than the previous provider's, so this can sit higher without
+# risking the earlier reservation-based 413s.
+_BASE_MAX_TOKENS = 16384
 
 # Hard ceiling we will never exceed even when escalating after a truncation
-# failure. The provider reserves prompt+max_tokens against the account's TPM
-# budget up front, so going much past this risks a 413 on every retry
-# instead of just the first one. Raise this only if the account's TPM limit
-# is raised too.
-_MAX_TOKENS_CEILING = 12288
+# failure. Raise this only if you're on a model whose context window can't
+# fit prompt + this many output tokens.
+_MAX_TOKENS_CEILING = 32768
 
 # How many times to retry with a bigger budget after a truncation/
 # reasoning-exhaustion failure before giving up and surfacing the error.
@@ -73,6 +72,10 @@ class _LogicResultSchema(BaseModel):
     correct: bool
     issues: list[str]
     confidence: Confidence
+
+
+class _CleanupResultSchema(BaseModel):
+    code: str
 
 
 @dataclass(slots=True)
@@ -141,6 +144,7 @@ class LLMClient:
                 "confidence: 'high'|'medium'|'low'}."
             ),
             user_prompt=prompt,
+            apply_budget_discipline=False,
         )
         try:
             parsed = _LogicResultSchema.model_validate(payload)
@@ -151,8 +155,27 @@ class LLMClient:
             issues=parsed.issues,
             confidence=parsed.confidence,
         )
+        
+    def cleanup_code(self, code: str) -> str:
+        payload = self._chat_json(
+            system_prompt=(
+                "You are an expert Python developer. Your objective is to clean up validated code "
+                "by removing sandbox-specific testing artifacts.\n"
+                "CRITICAL CONSTRAINTS:\n"
+                "1. Remove ONLY `_stub_missing_package`, `unittest.mock` imports/patches, and stubbed dummy connections.\n"
+                "2. DO NOT alter the core business logic, type hints, or error handling.\n"
+                "3. Return ONLY strict JSON matching this schema: {\"code\": \"string\"}.\n"
+                "4. DO NOT wrap the output in markdown code blocks."
+            ),
+            user_prompt=f"Clean this code:\n\n{code}",
+        )
+        try:
+            parsed = _CleanupResultSchema.model_validate(payload)
+            return parsed.code
+        except ValidationError as exc:
+            raise LLMClientError(f"Invalid cleanup schema: {exc}") from exc
 
-    def _chat_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+    def _chat_json(self, system_prompt: str, user_prompt: str, apply_budget_discipline: bool = True) -> dict[str, Any]:
         """
         Outer wrapper around _chat_json_once that adapts max_tokens on the
         fly. If a call fails because the model ran out of budget while
@@ -167,7 +190,7 @@ class LLMClient:
 
         for attempt in range(_TOKEN_BUDGET_RETRIES + 1):
             try:
-                return self._chat_json_once(system_prompt, user_prompt, max_tokens)
+                return self._chat_json_once(system_prompt, user_prompt, max_tokens, apply_budget_discipline)
             except _TokenBudgetExceededError as exc:
                 last_error = exc
                 if attempt == _TOKEN_BUDGET_RETRIES or max_tokens >= _MAX_TOKENS_CEILING:
@@ -175,6 +198,15 @@ class LLMClient:
                 max_tokens = min(max_tokens + _TOKEN_BUDGET_STEP, _MAX_TOKENS_CEILING)
                 self._log_stage(f"llm_call_retry_larger_budget_{max_tokens}")
                 continue
+            except (APIConnectionError, RateLimitError, InternalServerError) as exc:
+                # tenacity's retries inside _chat_json_once were exhausted and
+                # reraise=True let the ORIGINAL OpenAI exception through. Every
+                # caller of this class only knows about LLMClientError, so an
+                # unconverted SDK exception here would crash agent.py outright
+                # instead of producing a normal failed AgentResult.
+                raise LLMClientError(
+                    f"LLM request failed after retries ({type(exc).__name__}): {exc}"
+                ) from exc
 
         assert last_error is not None
         raise LLMClientError(
@@ -184,15 +216,22 @@ class LLMClient:
         ) from last_error
 
     @retry(
-        # Removed LLMClientError so fatal errors (like 400 Bad Request) fail fast
+        # Removed LLMClientError so fatal errors (like 400 Bad Request) fail fast.
+        # Capped at 2 (was 4): this already runs inside the outer budget-escalation
+        # loop in _chat_json, 4 inner x 3 outer meant a single generate() call could
+        # fire up to 12 real API requests with exponential backoff on a bad day.
         retry=retry_if_exception_type((APIConnectionError, RateLimitError, InternalServerError)),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        stop=stop_after_attempt(4),
+        stop=stop_after_attempt(2),
         reraise=True
     )
-    def _chat_json_once(self, system_prompt: str, user_prompt: str, max_tokens: int) -> dict[str, Any]:
+    def _chat_json_once(
+        self, system_prompt: str, user_prompt: str, max_tokens: int, apply_budget_discipline: bool = True
+    ) -> dict[str, Any]:
         self._log_stage("llm_call_start")
-        effective_system_prompt = system_prompt + _BUDGET_DISCIPLINE_SUFFIX
+        effective_system_prompt = system_prompt
+        if apply_budget_discipline:
+            effective_system_prompt = system_prompt + _BUDGET_DISCIPLINE_SUFFIX
         try:
             response = self._client.chat.completions.create(
                 model=self._model,

@@ -25,6 +25,10 @@ _MAX_OUTPUT_CHARS = 4000
 
 _ENVIRONMENT_ISSUE_PREFIX = "ENVIRONMENT ISSUE (not a code bug): "
 
+# Exported so agent.py can detect this specific failure and skip sending it
+# to the LLM repair loop, repairing code that was never actually broken.
+ENVIRONMENT_ERROR_MARKER = "Environment Error (missing pip in sandbox)."
+
 
 def _truncate(text: str, limit: int = _MAX_OUTPUT_CHARS) -> str:
     """Cap captured stdout/stderr so a pathological program can't balloon the result."""
@@ -54,19 +58,34 @@ def _is_missing_dependency_failure(stderr: str) -> bool:
     import, falls back to auto-installing the package on ImportError, and
     that install fails because the execution sandbox itself has no working
     pip (a broken/minimal venv), not because the generated code is wrong.
-    This is intentionally narrow: it only matches when both a missing
-    module AND a failed pip invocation show up together, so a genuine
-    "forgot to import X" bug in the generated code (which raises
-    ModuleNotFoundError alone, with no pip attempt) is still reported as a
-    normal failure.
+
+    Deliberately strict: a missing-module error alone is not enough (that's
+    the normal "forgot to import X" case), and neither is a generic
+    CalledProcessError or the word "pip" appearing anywhere in stderr, since
+    generated code can raise CalledProcessError or mention pip for reasons
+    that have nothing to do with the sandbox's own pip being broken. The
+    pip-failure indicator must appear on the SAME line as "pip" to count.
     """
-    has_missing_module = "ModuleNotFoundError" in stderr or "No module named" in stderr
-    pip_attempt_failed = (
-        "No module named pip" in stderr
-        or "CalledProcessError" in stderr
-        or "pip install" in stderr
-    )
-    return has_missing_module and pip_attempt_failed
+    if not stderr:
+        return False
+
+    lower = stderr.lower()
+    has_missing_module = "modulenotfounderror" in lower or "no module named " in lower
+    if not has_missing_module:
+        return False
+
+    for line in stderr.splitlines():
+        line_lower = line.lower()
+        if "pip" not in line_lower:
+            continue
+        if "no module named pip" in line_lower:
+            return True
+        if "command not found" in line_lower:
+            return True
+        if "calledprocesserror" in line_lower:
+            return True
+
+    return False
 
 
 class Validator:
@@ -105,6 +124,20 @@ class Validator:
             )
 
         notes = self._run_pyflakes(code)
+        # Pyflakes findings like unused imports are style, not correctness,
+        # so they stay informational. "undefined name" means the code WILL
+        # crash at runtime, that is a real bug and must not slip through as
+        # a silent pass.
+        critical = [n for n in notes if "undefined name" in n]
+        if critical:
+            self._log_stage("static_check_fail")
+            return CheckResult(
+                passed=False,
+                issues=critical,
+                confidence="high",
+                error="Pyflakes detected undefined name(s).",
+                notes=notes,
+            )
         self._log_stage("static_check_pass")
         return CheckResult(
             passed=True,
@@ -171,10 +204,16 @@ class Validator:
 
         preexec_fn = None
         if platform.system() != "Windows":
+            # CPU-seconds and wall-clock seconds measure different things:
+            # I/O-bound code can run past its CPU budget well before the
+            # wall-clock timeout below fires. Giving the CPU limit a few
+            # seconds of headroom means the wall-clock timeout (which is
+            # caught cleanly as TimeoutExpired) is the one that normally
+            # fires first, rather than an abrupt SIGKILL from RLIMIT_CPU.
             preexec_fn = functools.partial(
                 _apply_resource_limits,
                 self._memory_limit_mb,
-                self._execution_timeout_sec,
+                self._execution_timeout_sec + 5,
             )
 
         try:
@@ -231,7 +270,7 @@ class Validator:
                     passed=False,
                     issues=[issue],
                     confidence="low",
-                    error="Environment Error (missing pip in sandbox).",
+                    error=ENVIRONMENT_ERROR_MARKER,
                 )
 
             issue = f"Runtime Error (Exit Code {result.returncode}):\n{stderr}"

@@ -29,6 +29,11 @@ def create_agent() -> CodeAgent:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Direct CLI for codegen_validator")
     parser.add_argument("query", help="Natural language query to generate code for")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Also print non-blocking reviewer commentary on a PASS (hidden by default).",
+    )
     return parser.parse_args()
 
 
@@ -54,12 +59,12 @@ def main() -> int:
         print("Please run the CLI again with a more specific prompt.\n")
         return 1
 
-    print("Generated Code:")
+    print("Cleaned, Ready-to-Run Code:")
     print(result.code)
     print()
 
     if result.tests:
-        print("Generated Tests:")
+        print("Sandbox Tests (Note: These may still contain mock objects used for internal validation):")
         print(result.tests)
         print()
 
@@ -76,10 +81,12 @@ def main() -> int:
         f"confidence={result.confidence} | retries_taken={result.retries_taken}"
     )
 
-    if result.issues:
-        print("Issues:")
+    if result.issues and (not result.passed or args.verbose):
+        print("Issues:" if not result.passed else "Reviewer notes (non-blocking):")
         for issue in result.issues:
             print(f"- {issue}")
+    elif result.issues and result.passed:
+        print(f"({len(result.issues)} non-blocking reviewer note(s) hidden, rerun with --verbose to see them)")
 
     return 0 if result.passed else 1
 
