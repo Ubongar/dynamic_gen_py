@@ -23,6 +23,12 @@ _DEFAULT_TIMEOUT_SEC = 10
 _DEFAULT_MEMORY_LIMIT_MB = 256
 _MAX_OUTPUT_CHARS = 4000
 
+_ENVIRONMENT_ISSUE_PREFIX = "ENVIRONMENT ISSUE (not a code bug): "
+
+# Exported so agent.py can detect this specific failure and skip sending it
+# to the LLM repair loop, repairing code that was never actually broken.
+ENVIRONMENT_ERROR_MARKER = "Environment Error (missing pip in sandbox)."
+
 
 def _truncate(text: str, limit: int = _MAX_OUTPUT_CHARS) -> str:
     """Cap captured stdout/stderr so a pathological program can't balloon the result."""
@@ -44,6 +50,42 @@ def _apply_resource_limits(memory_limit_mb: int, cpu_limit_sec: int) -> None:
     memory_bytes = memory_limit_mb * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))  # type: ignore[attr-defined]
     resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit_sec, cpu_limit_sec))  # type: ignore[attr-defined]
+
+
+def _is_missing_dependency_failure(stderr: str) -> bool:
+    """
+    Detects the specific pattern where generated code correctly tries an
+    import, falls back to auto-installing the package on ImportError, and
+    that install fails because the execution sandbox itself has no working
+    pip (a broken/minimal venv), not because the generated code is wrong.
+
+    Deliberately strict: a missing-module error alone is not enough (that's
+    the normal "forgot to import X" case), and neither is a generic
+    CalledProcessError or the word "pip" appearing anywhere in stderr, since
+    generated code can raise CalledProcessError or mention pip for reasons
+    that have nothing to do with the sandbox's own pip being broken. The
+    pip-failure indicator must appear on the SAME line as "pip" to count.
+    """
+    if not stderr:
+        return False
+
+    lower = stderr.lower()
+    has_missing_module = "modulenotfounderror" in lower or "no module named " in lower
+    if not has_missing_module:
+        return False
+
+    for line in stderr.splitlines():
+        line_lower = line.lower()
+        if "pip" not in line_lower:
+            continue
+        if "no module named pip" in line_lower:
+            return True
+        if "command not found" in line_lower:
+            return True
+        if "calledprocesserror" in line_lower:
+            return True
+
+    return False
 
 
 class Validator:
@@ -82,6 +124,20 @@ class Validator:
             )
 
         notes = self._run_pyflakes(code)
+        # Pyflakes findings like unused imports are style, not correctness,
+        # so they stay informational. "undefined name" means the code WILL
+        # crash at runtime, that is a real bug and must not slip through as
+        # a silent pass.
+        critical = [n for n in notes if "undefined name" in n]
+        if critical:
+            self._log_stage("static_check_fail")
+            return CheckResult(
+                passed=False,
+                issues=critical,
+                confidence="high",
+                error="Pyflakes detected undefined name(s).",
+                notes=notes,
+            )
         self._log_stage("static_check_pass")
         return CheckResult(
             passed=True,
@@ -148,10 +204,16 @@ class Validator:
 
         preexec_fn = None
         if platform.system() != "Windows":
+            # CPU-seconds and wall-clock seconds measure different things:
+            # I/O-bound code can run past its CPU budget well before the
+            # wall-clock timeout below fires. Giving the CPU limit a few
+            # seconds of headroom means the wall-clock timeout (which is
+            # caught cleanly as TimeoutExpired) is the one that normally
+            # fires first, rather than an abrupt SIGKILL from RLIMIT_CPU.
             preexec_fn = functools.partial(
                 _apply_resource_limits,
                 self._memory_limit_mb,
-                self._execution_timeout_sec,
+                self._execution_timeout_sec + 5,
             )
 
         try:
@@ -186,6 +248,31 @@ class Validator:
                 )
 
             self._log_stage("execution_check_fail")
+
+            if _is_missing_dependency_failure(stderr):
+                # The generated code's own logic never got to run, it failed
+                # while trying to auto-install a missing package because this
+                # sandbox's venv has no working pip. Surface this distinctly
+                # so it isn't mistaken for a real logic bug in the generated
+                # code, and don't send it into the repair loop as if the code
+                # itself needs changing, low confidence reflects that we did
+                # not actually verify the code's behavior.
+                self._log_stage("execution_check_environment_issue")
+                issue = (
+                    f"{_ENVIRONMENT_ISSUE_PREFIX}the generated code's dependency "
+                    f"auto-install fallback failed because this execution sandbox "
+                    f"has no working pip. This does not indicate a problem with the "
+                    f"generated code's logic. Fix by running 'python -m ensurepip "
+                    f"--upgrade' in the sandbox venv, or pre-installing the needed "
+                    f"packages there.\nOriginal error:\n{stderr}"
+                )
+                return CheckResult(
+                    passed=False,
+                    issues=[issue],
+                    confidence="low",
+                    error=ENVIRONMENT_ERROR_MARKER,
+                )
+
             issue = f"Runtime Error (Exit Code {result.returncode}):\n{stderr}"
             return CheckResult(
                 passed=False,
