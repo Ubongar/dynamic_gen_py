@@ -19,21 +19,10 @@ from .models import Confidence, GenResult
 
 LOGGER = logging.getLogger(__name__)
 
-# Baseline budget for a single request. OpenAI's real rate limits are far
-# higher than the previous provider's, so this can sit higher without
-# risking the earlier reservation-based 413s.
+# Module-level defaults, used unless overridden per-instance via __init__.
 _BASE_MAX_TOKENS = 16384
-
-# Hard ceiling we will never exceed even when escalating after a truncation
-# failure. Raise this only if you're on a model whose context window can't
-# fit prompt + this many output tokens.
 _MAX_TOKENS_CEILING = 32768
-
-# How many times to retry with a bigger budget after a truncation/
-# reasoning-exhaustion failure before giving up and surfacing the error.
 _TOKEN_BUDGET_RETRIES = 2
-
-# How much to add to max_tokens on each retry after a truncation failure.
 _TOKEN_BUDGET_STEP = 2048
 
 # Appended to every system prompt to discourage the model from spending its
@@ -86,12 +75,24 @@ class LogicReviewResult:
 
 
 class LLMClient:
-    def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str | None = None,
+        base_max_tokens: int = _BASE_MAX_TOKENS,
+        max_tokens_ceiling: int = _MAX_TOKENS_CEILING,
+        token_budget_retries: int = _TOKEN_BUDGET_RETRIES,
+        token_budget_step: int = _TOKEN_BUDGET_STEP,
+    ) -> None:
         self._client = OpenAI(
             api_key=api_key or os.getenv("OPENAI_API_KEY"),
             base_url=os.getenv("OPENAI_BASE_URL"),
         )
         self._model = model or os.getenv("OPENAI_MODEL", "olori-image")
+        self._base_max_tokens = base_max_tokens
+        self._max_tokens_ceiling = max_tokens_ceiling
+        self._token_budget_retries = token_budget_retries
+        self._token_budget_step = token_budget_step
 
     @staticmethod
     def _parse_gen_result(payload: dict[str, Any]) -> GenResult:
@@ -185,17 +186,17 @@ class LLMClient:
         retried here and propagates immediately, retrying those would just
         burn time reproducing the same failure.
         """
-        max_tokens = _BASE_MAX_TOKENS
+        max_tokens = self._base_max_tokens
         last_error: LLMClientError | None = None
 
-        for attempt in range(_TOKEN_BUDGET_RETRIES + 1):
+        for attempt in range(self._token_budget_retries + 1):
             try:
                 return self._chat_json_once(system_prompt, user_prompt, max_tokens, apply_budget_discipline)
             except _TokenBudgetExceededError as exc:
                 last_error = exc
-                if attempt == _TOKEN_BUDGET_RETRIES or max_tokens >= _MAX_TOKENS_CEILING:
+                if attempt == self._token_budget_retries or max_tokens >= self._max_tokens_ceiling:
                     break
-                max_tokens = min(max_tokens + _TOKEN_BUDGET_STEP, _MAX_TOKENS_CEILING)
+                max_tokens = min(max_tokens + self._token_budget_step, self._max_tokens_ceiling)
                 self._log_stage(f"llm_call_retry_larger_budget_{max_tokens}")
                 continue
             except (APIConnectionError, RateLimitError, InternalServerError) as exc:
@@ -210,7 +211,7 @@ class LLMClient:
 
         assert last_error is not None
         raise LLMClientError(
-            f"{last_error} (gave up after {_TOKEN_BUDGET_RETRIES + 1} attempts, "
+            f"{last_error} (gave up after {self._token_budget_retries + 1} attempts, "
             f"final max_tokens={max_tokens}). The request likely needs more output "
             "than the account's token budget currently allows for a single call."
         ) from last_error
