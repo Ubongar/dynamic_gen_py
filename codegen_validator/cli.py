@@ -20,8 +20,45 @@ def create_agent() -> CodeAgent:
 
     model = os.getenv("OPENAI_MODEL", "olori-image")
     llm_client = LLMClient(api_key=api_key, model=model)
-    generator = Generator(llm_client=llm_client)
-    validator = Validator(llm_client=llm_client)
+
+    # Optional Groq-backed client, used ONLY as a fallback for the cleanup
+    # step when local AST stripping can't fully clean the mock scaffolding.
+    # Never used for generate/repair/logic_check, that path is always
+    # re-validated by static_check regardless of which model produced it,
+    # so this can't reduce overall accuracy. Opt-in: only activates if
+    # GROQ_API_KEY is set.
+    cleanup_llm_client = None
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if groq_api_key:
+        cleanup_llm_client = LLMClient(
+            api_key=groq_api_key,
+            model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+            base_url=os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
+        )
+
+    # Optional lighter OpenAI model for logic_check review. Opt-in only via
+    # OPENAI_REVIEW_MODEL, if unset this defaults to the same model as
+    # everything else, so accuracy is unchanged unless explicitly configured.
+    review_llm_client = None
+    review_model = os.getenv("OPENAI_REVIEW_MODEL")
+    if review_model:
+        review_llm_client = LLMClient(api_key=api_key, model=review_model)
+
+    # Set EXECUTION_TIMEOUT_SEC=none to disable the wall-clock execution
+    # timeout entirely (e.g. for code with a slow pip install fallback).
+    # On Windows this removes the ONLY runtime bound, see validator.py.
+    timeout_env = os.getenv("EXECUTION_TIMEOUT_SEC")
+    if timeout_env is not None and timeout_env.strip().lower() in ("none", "0", ""):
+        execution_timeout_sec = None
+    elif timeout_env is not None:
+        execution_timeout_sec = int(timeout_env)
+    else:
+        execution_timeout_sec = 10
+
+    generator = Generator(llm_client=llm_client, cleanup_llm_client=cleanup_llm_client)
+    validator = Validator(
+        llm_client=llm_client, review_llm_client=review_llm_client, execution_timeout_sec=execution_timeout_sec
+    )
 
     return CodeAgent(generator=generator, validator=validator, max_retries=3)
 
@@ -87,6 +124,11 @@ def main() -> int:
             print(f"- {issue}")
     elif result.issues and result.passed:
         print(f"({len(result.issues)} non-blocking reviewer note(s) hidden, rerun with --verbose to see them)")
+
+    if result.pipeline_notes:
+        print("Pipeline notes (cleanup step, not reviewer findings):")
+        for note in result.pipeline_notes:
+            print(f"- {note}")
 
     return 0 if result.passed else 1
 
