@@ -64,7 +64,7 @@ export GROQ_BASE_URL=https://api.groq.com/openai/v1  # optional, this is the def
 
 ### Optional: lighter model for logic review
 
-`OPENAI_REVIEW_MODEL` is opt-in and unset by default. If set, `logic_check` uses this model instead of the primary `OPENAI_MODEL`. Leave it unset unless you've verified the lighter model's review quality is acceptable for your use case, this is the one knob that can trade accuracy for speed if misused.
+`OPENAI_REVIEW_MODEL` is opt-in and unset by default. If set, `logic_check` uses this model instead of the primary `OPENAI_MODEL`. Leave it unset unless you've verified the lighter model's review quality is acceptable for your use case. This is the one knob that can trade accuracy for speed if misused.
 
 ```bash
 export OPENAI_REVIEW_MODEL=your-lighter-model   # optional, defaults to OPENAI_MODEL if unset
