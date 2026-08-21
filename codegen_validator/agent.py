@@ -90,11 +90,20 @@ class CodeAgent:
             if logic.passed:
                 self._log_stage("agent_run_pass")
                 
-                # --- NEW CLEANUP STEP ---
+                # --- CLEANUP STEP ---
                 self._log_stage("agent_run_cleanup_start")
                 clean_code = self._generator.cleanup(result.code)
-                if clean_code == result.code:
-                    logic.issues.append("Note: Post-validation cleanup failed or made no changes; mock objects may still be present.")
+                pipeline_notes: list[str] = []
+
+                if clean_code != result.code:
+                    # Validate the cleaned code to prevent shipping broken syntax
+                    clean_static = self._validator.static_check(clean_code)
+                    if not clean_static.passed:
+                        clean_code = result.code
+                        pipeline_notes.append("Post-validation cleanup introduced a syntax error and was rolled back.")
+                elif "unittest.mock" in result.code or "_stub_missing_package" in result.code:
+                    # Only flag a failure if there was actually something to clean
+                    pipeline_notes.append("Post-validation cleanup failed; mock objects may still be present.")
                 # ------------------------
 
                 return AgentResult(
@@ -107,6 +116,7 @@ class CodeAgent:
                     retries_taken=retries_taken,
                     tests=result.tests,
                     clarification_needed=None,
+                    pipeline_notes=pipeline_notes,
                 )
 
             if attempt == self._max_retries - 1:

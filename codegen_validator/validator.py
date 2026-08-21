@@ -20,6 +20,7 @@ from .models import CheckResult
 LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SEC = 10
+_UNBOUNDED_TIMEOUT_CPU_BACKSTOP_SEC = 300
 _DEFAULT_MEMORY_LIMIT_MB = 256
 _MAX_OUTPUT_CHARS = 4000
 
@@ -92,12 +93,17 @@ class Validator:
     def __init__(
         self,
         llm_client: LLMClient,
-        execution_timeout_sec: int = _DEFAULT_TIMEOUT_SEC,
+        execution_timeout_sec: int | None = _DEFAULT_TIMEOUT_SEC,
         memory_limit_mb: int = _DEFAULT_MEMORY_LIMIT_MB,
+        review_llm_client: LLMClient | None = None,
     ) -> None:
         self._llm_client = llm_client
         self._execution_timeout_sec = execution_timeout_sec
         self._memory_limit_mb = memory_limit_mb
+        # Opt-in only: defaults to the SAME client as everything else, so
+        # accuracy is unchanged unless the caller explicitly wires in a
+        # lighter model for review_logic.
+        self._review_llm_client = review_llm_client or llm_client
 
     def static_check(self, code: str) -> CheckResult:
         self._log_stage("static_check_start")
@@ -210,10 +216,27 @@ class Validator:
             # seconds of headroom means the wall-clock timeout (which is
             # caught cleanly as TimeoutExpired) is the one that normally
             # fires first, rather than an abrupt SIGKILL from RLIMIT_CPU.
+            # If the wall-clock timeout is disabled (None), this CPU limit
+            # becomes the ONLY backstop, so fall back to a generous but
+            # still bounded value instead of leaving it fully unbounded.
+            cpu_limit_sec = (
+                self._execution_timeout_sec + 5
+                if self._execution_timeout_sec is not None
+                else _UNBOUNDED_TIMEOUT_CPU_BACKSTOP_SEC
+            )
             preexec_fn = functools.partial(
                 _apply_resource_limits,
                 self._memory_limit_mb,
-                self._execution_timeout_sec + 5,
+                cpu_limit_sec,
+            )
+        elif self._execution_timeout_sec is None:
+            # Windows has no RLIMIT_CPU backstop at all, so a disabled
+            # wall-clock timeout here means truly no bound on runtime,
+            # including for genuinely infinite loops.
+            LOGGER.warning(
+                "execution_timeout_sec is disabled on Windows with no CPU-limit "
+                "backstop available, generated code (including infinite loops) "
+                "can run indefinitely."
             )
 
         try:
@@ -322,7 +345,7 @@ class Validator:
             f"Description:\n{description}\n\n"
             f"Code:\n{code}"
         )
-        review = self._llm_client.review_logic(prompt=prompt)
+        review = self._review_llm_client.review_logic(prompt=prompt)
         passed = review.correct and review.confidence in ("high", "medium")
 
         if passed:

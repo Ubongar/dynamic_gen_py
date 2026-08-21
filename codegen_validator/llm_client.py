@@ -79,6 +79,7 @@ class LLMClient:
         self,
         api_key: str | None = None,
         model: str | None = None,
+        base_url: str | None = None,
         base_max_tokens: int = _BASE_MAX_TOKENS,
         max_tokens_ceiling: int = _MAX_TOKENS_CEILING,
         token_budget_retries: int = _TOKEN_BUDGET_RETRIES,
@@ -86,7 +87,7 @@ class LLMClient:
     ) -> None:
         self._client = OpenAI(
             api_key=api_key or os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL"),
+            base_url=base_url or os.getenv("OPENAI_BASE_URL"),
         )
         self._model = model or os.getenv("OPENAI_MODEL", "olori-image")
         self._base_max_tokens = base_max_tokens
@@ -335,14 +336,15 @@ class LLMClient:
                 parsed = parsed[0]
         except json.JSONDecodeError as exc:
             truncated_output = content[:500] + "\n...[truncated]" if len(content) > 500 else content
-            # A response that finished with a broken JSON body (unterminated
-            # string, missing closing brace, "expecting value" at the tail,
-            # etc.) is almost always the same root cause as the empty-content
-            # case above: the model ran out of room mid-write. Treat it the
-            # same way, retry with a bigger budget, rather than failing hard.
-            raise _TokenBudgetExceededError(
-                f"LLM response was truncated before valid JSON completed "
-                f"(max_tokens={max_tokens}).\nError: {exc}\nRaw Output:\n{truncated_output}"
+            
+            if finish_reason == "length":
+                raise _TokenBudgetExceededError(
+                    f"LLM response was truncated before valid JSON completed "
+                    f"(max_tokens={max_tokens}).\nError: {exc}\nRaw Output:\n{truncated_output}"
+                ) from exc
+            
+            raise LLMClientError(
+                f"LLM returned malformed JSON that could not be parsed.\nError: {exc}\nRaw Output:\n{truncated_output}"
             ) from exc
 
         if not isinstance(parsed, dict):

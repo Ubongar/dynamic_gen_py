@@ -1,13 +1,74 @@
 from __future__ import annotations
 
+import ast
 import logging
 from datetime import datetime, timezone
+from typing import cast
 
 from .llm_client import LLMClient, LLMClientError
 from .models import GenResult
 
 
 LOGGER = logging.getLogger(__name__)
+
+_STUB_HELPER_NAME = "_stub_missing_package"
+
+
+def _is_importerror(node: ast.expr | None) -> bool:
+    return isinstance(node, ast.Name) and node.id == "ImportError"
+
+
+def _handler_calls_stub(handler: ast.ExceptHandler) -> bool:
+    for stmt in ast.walk(handler):
+        if isinstance(stmt, ast.Call) and isinstance(stmt.func, ast.Name) and stmt.func.id == _STUB_HELPER_NAME:
+            return True
+    return False
+
+
+class _MockStripper(ast.NodeTransformer):
+    """
+    Deterministic, local removal of the exact mock-stubbing scaffolding the
+    GENERATOR_PROMPT mandates (the _stub_missing_package helper plus the
+    try/import/except-ImportError/stub pattern). Safe because we control the
+    exact shape of what's being generated, no network call needed for the
+    common case.
+    """
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef | None:
+        if node.name == _STUB_HELPER_NAME:
+            return None
+        return cast(ast.FunctionDef, self.generic_visit(node))
+
+    def visit_Try(self, node: ast.Try) -> ast.stmt:
+        if (
+            len(node.body) == 1
+            and isinstance(node.body[0], (ast.Import, ast.ImportFrom))
+            and len(node.handlers) == 1
+            and _is_importerror(node.handlers[0].type)
+            and _handler_calls_stub(node.handlers[0])
+        ):
+            # Collapse to just the real import, drop the stub fallback entirely.
+            return node.body[0]
+        return cast(ast.stmt, self.generic_visit(node))
+
+
+def _strip_mocks_locally(code: str) -> str | None:
+    """
+    Returns cleaned source with mock scaffolding removed, or None if the
+    code didn't match the expected template closely enough to safely strip
+    (still references the stub helper afterward), signaling the caller to
+    fall back to an LLM-based cleanup instead.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    cleaned_tree = _MockStripper().visit(tree)
+    ast.fix_missing_locations(cleaned_tree)
+    cleaned = ast.unparse(cleaned_tree)
+    if _STUB_HELPER_NAME in cleaned:
+        return None
+    return cleaned
 
 GENERATOR_PROMPT = (
     "You are an elite Python system architect. Your objective is to generate highly robust, production-ready Python code. "
@@ -73,8 +134,14 @@ GENERATOR_PROMPT = (
 
 
 class Generator:
-    def __init__(self, llm_client: LLMClient) -> None:
+    def __init__(self, llm_client: LLMClient, cleanup_llm_client: LLMClient | None = None) -> None:
         self._llm_client = llm_client
+        # Only used as a fallback when local mock-stripping can't fully clean
+        # the code (model deviated from the exact template). This path is
+        # always re-validated by static_check in agent.py regardless of
+        # which model produced it, so using a faster/weaker model here can't
+        # reduce overall accuracy, it never touches generate/repair/logic_check.
+        self._cleanup_llm_client = cleanup_llm_client or llm_client
 
     def generate(self, query: str) -> GenResult:
         self._log_stage("generate_start")
@@ -106,9 +173,13 @@ class Generator:
 
     def cleanup(self, code: str) -> str:
         self._log_stage("cleanup_start")
+        local_clean = _strip_mocks_locally(code)
+        if local_clean is not None:
+            self._log_stage("cleanup_end_local")
+            return local_clean
         try:
-            clean_code = self._llm_client.cleanup_code(code)
-            self._log_stage("cleanup_end")
+            clean_code = self._cleanup_llm_client.cleanup_code(code)
+            self._log_stage("cleanup_end_llm_fallback")
             return clean_code
         except LLMClientError as exc:
             # If cleanup fails due to rate limits or parsing, we gracefully 

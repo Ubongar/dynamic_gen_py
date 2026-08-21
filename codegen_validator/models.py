@@ -34,6 +34,7 @@ class AgentResult:
     retries_taken: int
     tests: str = ""
     clarification_needed: str | None = None
+    pipeline_notes: list[str] = field(default_factory=list)  # cleanup/infra notes, NOT reviewer findings
 
 
 
